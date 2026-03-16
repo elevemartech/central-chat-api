@@ -22,7 +22,8 @@ dependencies = [
     "python-dotenv (>=1.0)",
     "pillow (>=10.0)",
     "gunicorn (>=22.0)",
-    "daphne (>=4.1)"
+    "daphne (>=4.1)",
+    "drf-nested-routers (>=0.95.0,<0.96.0)"
 ]
 
 
