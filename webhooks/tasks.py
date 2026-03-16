@@ -11,26 +11,27 @@ channel_layer = get_channel_layer()
 
 @shared_task(bind=True, max_retries=3, default_retry_delay=15)
 def process_uazapi_event(self, account_id: str, payload: dict):
-    event = payload.get("event") or payload.get("type", "")
+    """
+    Entry point para todos os eventos do uazapi.
+    Estrutura real do payload:
+      - payload["EventType"]  → "messages", "chats", "connection", etc.
+      - payload["message"]    → dados da mensagem
+      - payload["chat"]       → dados do contato/conversa
+    """
+    event_type = payload.get("EventType", "")
 
-    # LOG TEMPORÁRIO — mostra o payload completo para debug
-    logger.info("=== PAYLOAD RECEBIDO ===")
-    logger.info("event: %s", event)
-    logger.info("payload keys: %s", list(payload.keys()))
-    logger.info("payload completo: %s", payload)
-    logger.info("========================")
+    logger.info("Evento recebido: EventType=%s instance=%s", event_type, payload.get("instanceName", ""))
 
     try:
-        if event == "onmessage":
+        if event_type == "messages":
             handle_incoming_message(account_id, payload)
-        elif event == "onack":
-            handle_ack(payload)
-        elif event in ("onconnected", "ondisconnected"):
-            handle_connection_status(account_id, event)
+        elif event_type == "connection":
+            status = payload.get("status", "")
+            handle_connection_status(account_id, status)
         else:
-            logger.warning("Evento ignorado (não mapeado): '%s'", event)
+            logger.debug("Evento ignorado: %s", event_type)
     except Exception as exc:
-        logger.exception("Erro ao processar evento %s da conta %s", event, account_id)
+        logger.exception("Erro ao processar evento %s da conta %s", event_type, account_id)
         raise self.retry(exc=exc)
 
 
@@ -40,30 +41,41 @@ def handle_incoming_message(account_id: str, payload: dict):
     from accounts.models import Account
     from conversations.models import Contact, Conversation
     from chat_messages.models import Message
-    from media_handler.uazapi import detect_message_type, is_media_message, download_media
-    from media_handler.supabase import upload_bytes_to_supabase
 
-    data = payload.get("data", payload)
-    key = data.get("key", {})
+    message = payload.get("message", {})
+    chat = payload.get("chat", {})
 
-    if key.get("fromMe"):
+    # Ignora mensagens enviadas pela própria conta
+    if message.get("fromMe"):
+        logger.debug("Ignorando mensagem fromMe")
         return
 
-    raw_jid = key.get("remoteJid", "")
-    phone = raw_jid.replace("@s.whatsapp.net", "").replace("@g.us", "")
+    # Extrai telefone — remove sufixo @s.whatsapp.net
+    raw_chatid = message.get("chatid", "") or message.get("sender_pn", "")
+    phone = raw_chatid.replace("@s.whatsapp.net", "").replace("@g.us", "")
     if not phone:
-        logger.warning("JID inválido: %s", raw_jid)
+        logger.warning("Telefone não encontrado no payload")
         return
 
-    uazapi_msg_id = key.get("id", "")
+    uazapi_msg_id = message.get("messageid", "") or message.get("id", "")
 
-    if Message.objects.filter(uazapi_message_id=uazapi_msg_id).exists():
+    # Idempotência — evita duplicatas
+    if uazapi_msg_id and Message.objects.filter(uazapi_message_id=uazapi_msg_id).exists():
         logger.debug("Mensagem já processada: %s", uazapi_msg_id)
         return
 
     account = Account.objects.get(id=account_id)
-    push_name = data.get("pushName", "")
 
+    # Nome do contato
+    push_name = (
+        chat.get("wa_name")
+        or chat.get("wa_contactName")
+        or chat.get("name")
+        or message.get("senderName")
+        or ""
+    )
+
+    # ── Cadastro automático do contato ──────────────────────────────────────
     contact, created = Contact.objects.get_or_create(
         phone=phone,
         defaults={"name": push_name, "push_name": push_name},
@@ -80,8 +92,9 @@ def handle_incoming_message(account_id: str, payload: dict):
             contact.save(update_fields=updated_fields)
 
     if created:
-        logger.info("Novo contato cadastrado automaticamente: %s (%s)", phone, push_name)
+        logger.info("Novo contato cadastrado: %s (%s)", phone, push_name)
 
+    # ── Cadastro automático da conversa ─────────────────────────────────────
     conversation, conv_created = Conversation.objects.get_or_create(
         account=account,
         contact=contact,
@@ -89,77 +102,44 @@ def handle_incoming_message(account_id: str, payload: dict):
     if conv_created:
         logger.info("Nova conversa criada: conta=%s contato=%s", account.uazapi_instance, phone)
 
-    message_type = detect_message_type(data)
+    # ── Tipo e conteúdo da mensagem ──────────────────────────────────────────
+    raw_type = message.get("messageType", "") or message.get("type", "text")
+    type_map = {
+        "ExtendedTextMessage": "text",
+        "ImageMessage": "image",
+        "AudioMessage": "audio",
+        "VideoMessage": "video",
+        "DocumentMessage": "document",
+        "StickerMessage": "sticker",
+        "LocationMessage": "location",
+        "ContactMessage": "contact",
+        "text": "text",
+    }
+    message_type = type_map.get(raw_type, "text")
+    text_content = message.get("text", "") or ""
 
-    msg_body = data.get("message", {})
-    text_content = (
-        msg_body.get("conversation")
-        or msg_body.get("extendedTextMessage", {}).get("text", "")
-        or ""
-    )
+    # ── Timestamp ────────────────────────────────────────────────────────────
+    ts_raw = message.get("messageTimestamp")
+    if ts_raw:
+        # uazapi envia em milissegundos
+        ts_seconds = int(ts_raw) / 1000 if int(ts_raw) > 1e10 else int(ts_raw)
+        timestamp = datetime.fromtimestamp(ts_seconds, tz=timezone.utc)
+    else:
+        timestamp = now()
 
-    media_url = ""
-    media_mime = ""
-    media_filename = ""
-    media_size = None
-    audio_transcription = ""
-
-    if is_media_message(message_type) and uazapi_msg_id:
-        try:
-            result = download_media(
-                uazapi_message_id=uazapi_msg_id,
-                account_uazapi_instance=account.uazapi_instance,
-                account_uazapi_token=account.uazapi_token,
-                generate_mp3=(message_type == "audio"),
-                transcribe=False,
-            )
-
-            if result["file_bytes"]:
-                ext_map = {
-                    "image": "jpg", "audio": "mp3", "video": "mp4",
-                    "document": "bin", "sticker": "webp",
-                }
-                filename = f"{uazapi_msg_id}.{ext_map.get(message_type, 'bin')}"
-                media_url = upload_bytes_to_supabase(
-                    raw_bytes=result["file_bytes"],
-                    filename=filename,
-                    mime_type=result["mime_type"],
-                    account_id=str(account_id),
-                )
-                media_mime = result["mime_type"]
-                media_filename = filename
-                media_size = len(result["file_bytes"])
-                audio_transcription = result.get("transcription", "")
-            else:
-                media_url = result["file_url"]
-                media_mime = result["mime_type"]
-
-        except Exception as e:
-            logger.error("Falha ao baixar/armazenar mídia [%s]: %s", uazapi_msg_id, e)
-
-    location_data = msg_body.get("locationMessage", {})
-
-    ts_raw = data.get("messageTimestamp") or data.get("timestamp")
-    timestamp = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc) if ts_raw else now()
-
-    message = Message.objects.create(
+    # ── Persiste a mensagem ──────────────────────────────────────────────────
+    msg_obj = Message.objects.create(
         conversation=conversation,
         uazapi_message_id=uazapi_msg_id,
         direction="inbound",
         message_type=message_type,
         status="delivered",
         content=text_content,
-        media_url=media_url,
-        media_mime=media_mime,
-        media_filename=media_filename,
-        media_size=media_size,
-        audio_transcription=audio_transcription,
-        location_lat=location_data.get("degreesLatitude"),
-        location_lng=location_data.get("degreesLongitude"),
-        location_name=location_data.get("name", ""),
         timestamp=timestamp,
     )
+    logger.info("Mensagem salva: %s | %s | '%s'", phone, message_type, text_content[:50])
 
+    # ── Atualiza conversa ────────────────────────────────────────────────────
     preview = text_content[:100] if text_content else f"[{message_type}]"
     Conversation.objects.filter(id=conversation.id).update(
         last_message_at=timestamp,
@@ -167,37 +147,16 @@ def handle_incoming_message(account_id: str, payload: dict):
         unread_count=conversation.unread_count + 1,
     )
 
-    _push_new_message(conversation, message)
+    # ── Push via WebSocket ───────────────────────────────────────────────────
+    _push_new_message(conversation, msg_obj)
     _push_conversation_update(conversation, account_id)
 
 
-def handle_ack(payload: dict):
-    from chat_messages.models import Message
-
-    data = payload.get("data", payload)
-    uazapi_msg_id = data.get("id") or data.get("key", {}).get("id", "")
-    ack_value = data.get("ack")
-
-    status_map = {1: "sent", 2: "delivered", 3: "read", -1: "failed"}
-    new_status = status_map.get(ack_value)
-
-    if not new_status or not uazapi_msg_id:
-        return
-
-    updated = Message.objects.filter(uazapi_message_id=uazapi_msg_id).update(status=new_status)
-    if updated:
-        try:
-            msg = Message.objects.select_related("conversation").get(uazapi_message_id=uazapi_msg_id)
-            _push_message_status(msg.conversation, uazapi_msg_id, new_status)
-        except Message.DoesNotExist:
-            pass
-
-
-def handle_connection_status(account_id: str, event: str):
+def handle_connection_status(account_id: str, status: str):
     from accounts.models import Account
-    is_connected = event == "onconnected"
+    is_connected = status in ("open", "connected", "onconnected")
     Account.objects.filter(id=account_id).update(is_connected=is_connected)
-    logger.info("Conta %s %s", account_id, "conectada" if is_connected else "desconectada")
+    logger.info("Conta %s status: %s", account_id, status)
 
 
 # ─── WebSocket push helpers ───────────────────────────────────────────────────
