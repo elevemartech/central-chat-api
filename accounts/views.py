@@ -8,6 +8,8 @@ from .permissions import IsAccountAdmin
 
 class AccountViewSet(viewsets.ModelViewSet):
     """CRUD de contas. Cada usuário vê apenas suas contas."""
+    
+    pagination_class = None  # ← adiciona essa linha
 
     def get_queryset(self):
         return Account.objects.filter(members__user=self.request.user)
