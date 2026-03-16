@@ -40,7 +40,7 @@ def handle_incoming_message(account_id: str, payload: dict):
     from media_handler.uazapi import detect_message_type, is_media_message, download_media
     from media_handler.supabase import upload_bytes_to_supabase
 
-    data = payload.get("data", payload)  # uazapi às vezes envia direto ou aninhado em "data"
+    data = payload.get("data", payload)
     key = data.get("key", {})
 
     # Ignora mensagens enviadas pela própria conta (fromMe) para evitar duplicatas
@@ -63,24 +63,39 @@ def handle_incoming_message(account_id: str, payload: dict):
     account = Account.objects.get(id=account_id)
     push_name = data.get("pushName", "")
 
-    contact, _ = Contact.objects.get_or_create(
+    # ── Cadastro automático do contato ──────────────────────────────────────
+    # Cria o contato se não existir. Se existir, atualiza o nome caso esteja vazio.
+    contact, created = Contact.objects.get_or_create(
         phone=phone,
         defaults={"name": push_name, "push_name": push_name},
     )
-    if push_name and not contact.name:
-        contact.name = push_name
-        contact.push_name = push_name
-        contact.save(update_fields=["name", "push_name"])
+    if not created and push_name:
+        updated_fields = []
+        if not contact.name:
+            contact.name = push_name
+            updated_fields.append("name")
+        if contact.push_name != push_name:
+            contact.push_name = push_name
+            updated_fields.append("push_name")
+        if updated_fields:
+            contact.save(update_fields=updated_fields)
 
-    conversation, created = Conversation.objects.get_or_create(
+    if created:
+        logger.info("Novo contato cadastrado automaticamente: %s (%s)", phone, push_name)
+
+    # ── Cadastro automático da conversa ─────────────────────────────────────
+    # Cria a conversa entre essa conta e esse contato se não existir ainda.
+    conversation, conv_created = Conversation.objects.get_or_create(
         account=account,
         contact=contact,
     )
+    if conv_created:
+        logger.info("Nova conversa criada: conta=%s contato=%s", account.uazapi_instance, phone)
 
-    # ── Tipo da mensagem ──
+    # ── Tipo da mensagem ─────────────────────────────────────────────────────
     message_type = detect_message_type(data)
 
-    # ── Texto ──
+    # ── Texto ────────────────────────────────────────────────────────────────
     msg_body = data.get("message", {})
     text_content = (
         msg_body.get("conversation")
@@ -88,7 +103,7 @@ def handle_incoming_message(account_id: str, payload: dict):
         or ""
     )
 
-    # ── Mídia — baixa do uazapi e sobe para o Supabase ──
+    # ── Mídia — baixa do uazapi e sobe para o Supabase ───────────────────────
     media_url = ""
     media_mime = ""
     media_filename = ""
@@ -102,7 +117,7 @@ def handle_incoming_message(account_id: str, payload: dict):
                 account_uazapi_instance=account.uazapi_instance,
                 account_uazapi_token=account.uazapi_token,
                 generate_mp3=(message_type == "audio"),
-                transcribe=False,  # habilite via setting se quiser transcrição automática
+                transcribe=False,
             )
 
             if result["file_bytes"]:
@@ -122,21 +137,20 @@ def handle_incoming_message(account_id: str, payload: dict):
                 media_size = len(result["file_bytes"])
                 audio_transcription = result.get("transcription", "")
             else:
-                # Fallback: salva apenas o link temporário do uazapi (válido 2 dias)
                 media_url = result["file_url"]
                 media_mime = result["mime_type"]
 
         except Exception as e:
             logger.error("Falha ao baixar/armazenar mídia [%s]: %s", uazapi_msg_id, e)
 
-    # ── Localização ──
+    # ── Localização ──────────────────────────────────────────────────────────
     location_data = msg_body.get("locationMessage", {})
 
-    # ── Timestamp ──
+    # ── Timestamp ────────────────────────────────────────────────────────────
     ts_raw = data.get("messageTimestamp") or data.get("timestamp")
     timestamp = datetime.fromtimestamp(int(ts_raw), tz=timezone.utc) if ts_raw else now()
 
-    # ── Persiste a mensagem ──
+    # ── Persiste a mensagem ──────────────────────────────────────────────────
     message = Message.objects.create(
         conversation=conversation,
         uazapi_message_id=uazapi_msg_id,
@@ -155,7 +169,7 @@ def handle_incoming_message(account_id: str, payload: dict):
         timestamp=timestamp,
     )
 
-    # ── Atualiza conversa ──
+    # ── Atualiza conversa ────────────────────────────────────────────────────
     preview = text_content[:100] if text_content else f"[{message_type}]"
     Conversation.objects.filter(id=conversation.id).update(
         last_message_at=timestamp,
@@ -163,7 +177,7 @@ def handle_incoming_message(account_id: str, payload: dict):
         unread_count=conversation.unread_count + 1,
     )
 
-    # ── Push via WebSocket ──
+    # ── Push via WebSocket ───────────────────────────────────────────────────
     _push_new_message(conversation, message)
     _push_conversation_update(conversation, account_id)
 
@@ -174,7 +188,7 @@ def handle_ack(payload: dict):
 
     data = payload.get("data", payload)
     uazapi_msg_id = data.get("id") or data.get("key", {}).get("id", "")
-    ack_value = data.get("ack")  # 1=sent, 2=delivered, 3=read, -1=error
+    ack_value = data.get("ack")
 
     status_map = {1: "sent", 2: "delivered", 3: "read", -1: "failed"}
     new_status = status_map.get(ack_value)
