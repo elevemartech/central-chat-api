@@ -12,6 +12,6 @@ urlpatterns = [
     # Apps
     path("api/", include("accounts.urls")),
     path("api/", include("conversations.urls")),
-    path("api/", include("messages.urls")),
+    path("api/", include("chat_messages.urls")),
     path("api/", include("webhooks.urls")),
 ]

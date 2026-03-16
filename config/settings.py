@@ -27,7 +27,7 @@ INSTALLED_APPS = [
     # Local apps
     "accounts",
     "conversations",
-    "messages",
+    "chat_messages",
     "webhooks",
     "media_handler",
 ]

@@ -36,7 +36,7 @@ def process_uazapi_event(self, account_id: str, payload: dict):
 def handle_incoming_message(account_id: str, payload: dict):
     from accounts.models import Account
     from conversations.models import Contact, Conversation
-    from messages.models import Message
+    from chat_messages.models import Message
     from media_handler.uazapi import detect_message_type, is_media_message, download_media
     from media_handler.supabase import upload_bytes_to_supabase
 
@@ -170,7 +170,7 @@ def handle_incoming_message(account_id: str, payload: dict):
 
 def handle_ack(payload: dict):
     """Atualiza status da mensagem: sent → delivered → read."""
-    from messages.models import Message
+    from chat_messages.models import Message
 
     data = payload.get("data", payload)
     uazapi_msg_id = data.get("id") or data.get("key", {}).get("id", "")
@@ -201,7 +201,7 @@ def handle_connection_status(account_id: str, event: str):
 # ─── WebSocket push helpers ───────────────────────────────────────────────────
 
 def _push_new_message(conversation, message):
-    from messages.serializers import MessageSerializer
+    from chat_messages.serializers import MessageSerializer
     try:
         group = f"conversation_{conversation.id}"
         async_to_sync(channel_layer.group_send)(
